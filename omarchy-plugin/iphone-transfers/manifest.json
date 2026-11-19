@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "digimonk.iphone-transfers",
+  "name": "iPhone Transfers",
+  "version": "1.0.0",
+  "author": "digimonk",
+  "license": "MIT",
+  "description": "Live progress of PhotoSync uploads (WebDAV/SFTP) into ~/iphone_backup: files done, speed and time left.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "iPhone Transfers",
+    "description": "A phone icon with a progress ring; click for a see-through panel with the transfer status.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "panelOpacity": 72
+    },
+    "schema": [
+      {
+        "key": "panelOpacity",
+        "type": "integer",
+        "label": "Panel opacity (%)",
+        "min": 30,
+        "max": 100,
+        "step": 2,
+        "defaultValue": 72
+      }
+    ]
+  }
+}

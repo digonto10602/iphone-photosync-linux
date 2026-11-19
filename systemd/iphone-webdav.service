@@ -1,0 +1,13 @@
+[Unit]
+Description=WebDAV server for PhotoSync uploads into ~/iphone_backup (port 8080, LAN only via ufw)
+After=network-online.target
+
+[Service]
+# Login name and password live in this file (readable only by you).
+EnvironmentFile=%h/.config/iphone-webdav/env
+ExecStart=/usr/bin/rclone serve webdav %h/iphone_backup --addr :8080 --log-level INFO
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Sort iPhone SFTP uploads in ~/iphone_backup into images/ and videos/
+
+[Service]
+ExecStart=%h/.local/bin/iphone-backup-sorter
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

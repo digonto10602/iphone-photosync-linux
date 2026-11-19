@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Sorts files uploaded (via SFTP) into ~/iphone_backup into images/ and videos/.
+# Runs as a systemd user service: iphone-backup-sorter.service
+set -uo pipefail
+
+ROOT="${IPHONE_BACKUP_DIR:-$HOME/iphone_backup}"
+IMG="$ROOT/images"
+VID="$ROOT/videos"
+mkdir -p "$IMG" "$VID"
+
+log() { echo "$*"; }
+
+classify() {
+  local ext="${1##*.}"; ext="${ext,,}"
+  case "$ext" in
+    heic|heif|jpg|jpeg|png|gif|webp|dng|tif|tiff|bmp|avif|raw|aae) echo images ;;
+    mov|mp4|m4v|hevc|avi|mkv|3gp|webm) echo videos ;;
+    *) echo "" ;;
+  esac
+}
+
+# iPhone Live Photo motion clips carry Apple's content-identifier tag (shared with their still).
+is_live_photo_clip() {
+  [[ -n "$(ffprobe -v error -show_entries format_tags=com.apple.quicktime.content.identifier \
+           -of default=nw=1:nk=1 "$1" 2>/dev/null)" ]]
+}
+
+sort_one() {
+  # $2 = "check-open": skip the file if any process still has it open (used by sweeps only;
+  # inotify close_write/moved_to events already mean the uploader is finished with it).
+  local f="$1" mode="${2:-}" name kind dest target base ext n rel sub s from="$ROOT"
+  [[ -f "$f" ]] || return 0
+  name="${f##*/}"
+  # Skip hidden / in-progress temp files; their final rename triggers a new event.
+  [[ "$name" == .* || "$name" == *.part || "$name" == *.partial || "$name" == *.tmp || "$name" == *.filepart ]] && return 0
+  # PhotoSync may upload straight into images/ or videos/ (e.g. videos/2026/11/IMG_1.MOV).
+  # A file already in the right folder is left alone; one in the wrong folder is moved to the
+  # other under the same sub-folder. .AAE edit sidecars and unknown types stay where they landed.
+  if [[ "$f" == "$IMG"/* || "$f" == "$VID"/* ]]; then
+    if [[ "$f" == "$IMG"/* ]]; then from="$IMG"; else from="$VID"; fi
+    ext="${name##*.}"; [[ "${ext,,}" == aae ]] && return 0
+    kind="$(classify "$name")"
+    [[ -z "$kind" || "$from" == "$ROOT/$kind" ]] && return 0
+    if [[ "$from" == "$IMG" ]]; then
+      # A video in images/: Live Photo clips belong here next to their still. Cheap check first
+      # (a photo with the same name beside it); only otherwise read the clip's Apple tag.
+      for s in "${f%.*}".{HEIC,heic,HEIF,heif,JPG,jpg,JPEG,jpeg}; do [[ -e "$s" ]] && return 0; done
+      is_live_photo_clip "$f" && return 0
+    fi
+  fi
+  if [[ "$mode" == check-open ]] && fuser -s "$f" 2>/dev/null; then return 0; fi
+
+  kind="$(classify "$name")"
+  [[ -z "$kind" ]] && { log "left in place (unknown type): $f"; return 0; }
+  # Live Photo clips uploaded to the top folder go next to their still in images/, not videos/.
+  [[ "$from" == "$ROOT" && "$kind" == videos ]] && is_live_photo_clip "$f" && kind=images
+  # Keep the sub-folder the file arrived in (e.g. 2026/11/), so files stay grouped by date:
+  #   ~/iphone_backup/2026/11/IMG_1.MOV        -> ~/iphone_backup/videos/2026/11/IMG_1.MOV
+  #   ~/iphone_backup/videos/2026/11/IMG_2.HEIC -> ~/iphone_backup/images/2026/11/IMG_2.HEIC
+  #   ~/iphone_backup/images/2026/11/IMG_3.MOV  -> ~/iphone_backup/videos/2026/11/IMG_3.MOV
+  rel="${f#"$from"/}"; sub="${rel%/*}"; [[ "$sub" == "$rel" ]] && sub=""
+  dest="$ROOT/$kind${sub:+/$sub}"
+  mkdir -p -- "$dest" || { log "ERROR cannot create $dest"; return 0; }
+  target="$dest/$name"
+
+  if [[ -e "$target" ]]; then
+    if cmp -s "$f" "$target"; then
+      rm -f -- "$f"; log "duplicate removed (identical to $target)"; return 0
+    fi
+    base="${name%.*}"; ext="${name##*.}"; n=1
+    while [[ -e "$dest/${base}_$n.$ext" ]]; do ((n++)); done
+    target="$dest/${base}_$n.$ext"
+  fi
+  mv -n -- "$f" "$target" && log "$kind: $name -> $target"
+}
+
+catch_up() {
+  # Files that arrived while the service was not running (older than 60 s).
+  # images/ and videos/ are included so misplaced files there get moved (correct ones are skipped cheaply).
+  find "$ROOT" -type f -mmin +1 -print0 |
+    while IFS= read -r -d '' f; do sort_one "$f" check-open; done
+}
+
+catch_up
+# Safety net: re-sweep every 5 minutes for anything an event did not catch.
+( while sleep 300; do catch_up; done ) &
+log "watching $ROOT"
+inotifywait -m -r -q -e close_write -e moved_to --format '%w%f' "$ROOT" |
+  while IFS= read -r f; do sort_one "$f"; done

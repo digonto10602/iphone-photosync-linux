@@ -1,0 +1,11 @@
+[Unit]
+Description=Open the iPhone Transfers progress window when a WebDAV upload starts
+After=iphone-webdav.service graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/iphone-transfers-autoopen
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

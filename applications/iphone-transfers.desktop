@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=iPhone Transfers
+Comment=Live progress of PhotoSync uploads into ~/iphone_backup
+Exec=omarchy launch or focus tui --app-id=org.omarchy.iphone-transfers iphone-transfers
+Icon=phone
+Terminal=false
+Categories=Utility;

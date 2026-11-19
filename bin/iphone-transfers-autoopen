@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# iphone-transfers-autoopen — pop up the "iPhone Transfers" bar panel when the
+# phone starts sending files over WebDAV.
+#
+# Watches the WebDAV server log (iphone-webdav.service). On an upload ("PUT from ...")
+# that starts a NEW transfer session (no upload in the previous GAP seconds), it opens the
+# window unless it is already open. Within a session it does nothing, so if you close the
+# window mid-transfer it stays closed until the next transfer.
+# Runs as the user service iphone-transfers-autoopen.service.
+set -uo pipefail
+
+GAP="${IPHONE_AUTOOPEN_GAP:-120}"   # seconds without uploads that end a transfer session
+last=0
+
+
+echo "waiting for WebDAV uploads (new session after ${GAP}s without uploads)"
+journalctl --user -u iphone-webdav.service -f -n 0 -o cat | while IFS= read -r line; do
+  [[ $line == *": PUT from "* ]] || continue
+  now=$(date +%s)
+  if (( now - last > GAP )); then
+    from=${line##*PUT from }
+    # Pop up the bar panel (Omarchy shell plugin digimonk.iphone-transfers).
+    echo "transfer started from ${from%:*}; opening the iPhone Transfers bar panel"
+    omarchy-shell iphone-transfers open >/dev/null 2>&1 \
+      || echo "ERROR could not open the bar panel (is the Omarchy shell running?)"
+  fi
+  last=$now
+done

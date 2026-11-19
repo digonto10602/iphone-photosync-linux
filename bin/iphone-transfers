@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""iphone-transfers — live view of PhotoSync uploads arriving in ~/iphone_backup.
+
+Shows, refreshed every second:
+  * whether the phone is connected (SFTP on port 22 or WebDAV on port 8080),
+  * OVERALL progress: files done out of the total you are sending, overall speed, time left,
+  * every file being uploaded right now, with its own bar, speed and time left,
+  * files finished in this session.
+
+The PC is never told how many files the phone will send, so the window asks for that number
+(the count PhotoSync shows on the phone). Press  t  at any time to enter or change it.
+
+How a single file's progress is known: iPhone videos (.MOV/.MP4) begin with a header that
+states the size of the video data, so the final size is estimated from it (the small index at
+the very end, ~0.03% of the file, is not counted until it arrives). For photos the final size
+is unknown, so only the bytes received are shown.
+
+The overall time left is an estimate: (bytes still missing in the files in flight) plus
+(files not started yet x average size of the files so far), divided by the speed over the
+last 20 seconds.
+
+Usage: iphone-transfers [--total N] [--since HH:MM]
+  --total N      number of files being sent (skips the question at start)
+  --since HH:MM  count files finished since this time today (default: when the window opened)
+"""
+import os, sys, time, struct, shutil, subprocess, argparse, select, termios, tty, datetime, json
+from collections import deque
+
+ROOT = os.path.expanduser(os.environ.get("IPHONE_BACKUP_DIR", "~/iphone_backup"))
+VIDEO_EXT = {".mov", ".mp4", ".m4v", ".3gp"}
+ACTIVE_SECS = 15        # a hidden partial file that grew within this many seconds counts as uploading
+STALL_SECS = 60         # a hidden partial file idle longer than this is shown as stalled
+SPEED_WINDOW = 20       # seconds over which the overall speed is averaged
+REFRESH = 1.0
+
+# ── terminal styling ──────────────────────────────────────────────────────────
+CSI = "\x1b["
+RESET, BOLD, DIM = CSI + "0m", CSI + "1m", CSI + "2m"
+GREEN, YELLOW, RED, CYAN, BLUE = (CSI + c + "m" for c in ("32", "33", "31", "36", "34"))
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1000 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000.0
+
+
+def duration(s):
+    if s is None or s < 0 or s > 99 * 3600:
+        return "--:--"
+    s = int(round(s))
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+
+def bar(frac, width, colour):
+    width = max(width, 5)
+    if frac is None:
+        return DIM + "·" * width + RESET
+    frac = min(max(frac, 0.0), 1.0)
+    full = frac * width
+    whole = int(full)
+    parts = " ▏▎▍▌▋▊▉"
+    tail = parts[int((full - whole) * 8)] if whole < width else ""
+    return colour + "█" * whole + tail + RESET + DIM + "░" * (width - whole - len(tail)) + RESET
+
+
+# ── expected size of an iPhone video from its header ─────────────────────────
+_expected_cache = {}
+
+
+def expected_size(path, ext):
+    """Final size estimated from the QuickTime/MP4 box headers, or None if unknown."""
+    if ext not in VIDEO_EXT:
+        return None
+    if path in _expected_cache:
+        return _expected_cache[path]
+    total, off = 0, 0
+    try:
+        size_now = os.path.getsize(path)
+        with open(path, "rb") as f:
+            for _ in range(32):                      # walk the top-level boxes
+                if off + 8 > size_now:
+                    return None                      # header not received yet
+                f.seek(off)
+                h = f.read(16)
+                n, kind = struct.unpack(">I4s", h[:8])
+                if n == 1:
+                    if len(h) < 16:
+                        return None
+                    n = struct.unpack(">Q", h[8:16])[0]
+                if n < 8:                            # size 0 = "to end of file": unknown
+                    return None
+                total, off = total + n, off + n
+                if kind == b"mdat":                  # the big media box: total is now known
+                    _expected_cache[path] = total
+                    return total
+    except OSError:
+        return None
+    return None
+
+
+# ── what is happening right now ───────────────────────────────────────────────
+def phone_connections():
+    """'address (protocol)' for each remote device connected by SFTP (port 22) or WebDAV (8080)."""
+    try:
+        out = subprocess.run(["ss", "-Htn", "state", "established", "( sport = :22 or sport = :8080 )"],
+                             capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    peers = []
+    for line in out.splitlines():
+        cols = line.split()
+        if len(cols) >= 4:
+            port = cols[2].rsplit(":", 1)[-1]
+            peer = cols[3].rsplit(":", 1)[0].strip("[]")
+            if peer.startswith("::ffff:"):
+                peer = peer[7:]
+            if peer not in ("127.0.0.1", "::1") and not peer.startswith("127."):
+                peers.append(f"{peer} {'WebDAV' if port == '8080' else 'SFTP'}")
+    return sorted(set(peers))
+
+
+def files_open_by_uploader():
+    """Paths under ROOT currently held open by the SFTP or WebDAV server process."""
+    held = set()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() not in ("sftp-server", "sshd-session", "sshd", "rclone"):
+                    continue
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                target = os.readlink(f"/proc/{pid}/fd/{fd}")
+                if target.startswith(ROOT + "/"):
+                    held.add(target)
+        except OSError:
+            continue
+    return held
+
+
+def scan():
+    """All files under ROOT -> (size, mtime, ctime)."""
+    out = {}
+    for dirpath, _dirs, files in os.walk(ROOT):
+        for name in files:
+            p = os.path.join(dirpath, name)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            out[p] = (st.st_size, st.st_mtime, st.st_ctime)
+    return out
+
+
+def display_name(path):
+    rel = os.path.relpath(path, ROOT)
+    head, name = os.path.split(rel)
+    if name.startswith("."):
+        name = name[1:]
+    return name, head
+
+
+# ── keyboard (press t to enter the total) ─────────────────────────────────────
+class Keys:
+    def __init__(self):
+        self.fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+        self.saved = termios.tcgetattr(self.fd) if self.fd is not None else None
+
+    def raw(self):
+        if self.fd is not None:
+            tty.setcbreak(self.fd)
+
+    def cooked(self):
+        if self.fd is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+    def wait(self, timeout):
+        """Sleep up to timeout seconds; return a pressed key or None."""
+        if self.fd is None:
+            time.sleep(timeout)
+            return None
+        r, _, _ = select.select([self.fd], [], [], timeout)
+        return os.read(self.fd, 1).decode(errors="ignore") if r else None
+
+
+def ask_total(keys, current, row):
+    keys.cooked()
+    sys.stdout.write(CSI + "?25h" + CSI + f"{row};1H" + CSI + "K")
+    sys.stdout.write(BOLD + "How many files are you sending? (the count PhotoSync shows; "
+                     "Enter = keep" + (f" {current}" if current else " unknown") + "): " + RESET)
+    sys.stdout.flush()
+    try:
+        answer = sys.stdin.readline().strip()
+    except (OSError, ValueError):
+        answer = ""
+    keys.raw()
+    sys.stdout.write(CSI + "?25l")
+    if answer.isdigit() and int(answer) > 0:
+        return int(answer)
+    return current
+
+
+# ── machine-readable feed for the Omarchy bar widget ─────────────────────────
+STATE_DIR = os.path.expanduser("~/.local/state/iphone-transfers")
+TOTAL_FILE = os.path.join(STATE_DIR, "total.json")
+SESSION_GAP = 300       # files finishing less than this many seconds apart belong to one transfer
+
+
+def set_total(n):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = TOTAL_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"total": int(n), "set_at": time.time()}, f)
+    os.replace(tmp, TOTAL_FILE)
+
+
+def read_total():
+    try:
+        with open(TOTAL_FILE) as f:
+            d = json.load(f)
+        n, t = int(d.get("total", 0)), float(d.get("set_at", 0))
+        return (n, t) if n > 0 else (None, 0.0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None, 0.0
+
+
+def json_loop():
+    """Print one JSON object per line describing the current transfer, forever.
+
+    A "session" is the run of finished files whose finish times are less than SESSION_GAP
+    seconds apart, ending with the most recent one; it is "live" while files are arriving or
+    the phone is connected. The total entered by the user applies to the session it was
+    entered for (entered after the previous session ended)."""
+    volume = deque()
+    speeds = deque(maxlen=60)
+    history = {}
+    while True:
+        now = time.time()
+        files = scan()
+        held = files_open_by_uploader()
+        peers = phone_connections()
+
+        volume.append((now, sum(v[0] for v in files.values())))
+        while volume and now - volume[0][0] > SPEED_WINDOW:
+            volume.popleft()
+        speed = 0.0
+        if len(volume) >= 2 and volume[-1][0] > volume[0][0]:
+            speed = max(0.0, (volume[-1][1] - volume[0][1]) / (volume[-1][0] - volume[0][0]))
+        speeds.append(round(speed))
+
+        active, stalled, complete = [], [], []
+        for p, (size, mtime, ctime) in files.items():
+            hist = history.setdefault(p, deque(maxlen=10))
+            if not hist or hist[-1][1] != size:
+                hist.append((now, size))
+            hidden = os.path.basename(p).startswith(".")
+            if p in held or (hidden and now - mtime < ACTIVE_SECS):
+                active.append(p)
+            elif hidden:
+                if now - mtime >= STALL_SECS:
+                    stalled.append(p)
+            else:
+                complete.append((ctime, p, size))
+        for p in list(history):
+            if p not in files:
+                del history[p]
+
+        # session = newest chain of finish times with gaps < SESSION_GAP
+        complete.sort(reverse=True)
+        session, prev_end = [], 0.0
+        for i, item in enumerate(complete):
+            if session and session[-1][0] - item[0] > SESSION_GAP:
+                prev_end = item[0]
+                break
+            session.append(item)
+        live = bool(active) or bool(peers) or (session and now - session[0][0] < 30)
+        if live and session and now - session[0][0] > SESSION_GAP and not active:
+            prev_end, session = session[0][0], []          # connected again after a long pause: new session
+        if live and not session and complete:
+            prev_end = complete[0][0]
+
+        done_n = len(session)
+        done_bytes = sum(s[2] for s in session)
+        total, set_at = read_total()
+        if total and set_at <= prev_end:
+            total = None                                   # entered for an earlier transfer
+
+        act_out, missing, frac_sum, sizes = [], 0, 0.0, [s[2] for s in session]
+        for p in sorted(active, key=lambda q: files[q][1], reverse=True):
+            size = files[p][0]
+            name, folder = display_name(p)
+            exp = expected_size(p, os.path.splitext(name)[1].lower())
+            h = [s for s in history.get(p, []) if now - s[0] <= 5] or list(history.get(p, []))[-1:]
+            fs = (h[-1][1] - h[0][1]) / (h[-1][0] - h[0][0]) if len(h) >= 2 and h[-1][0] > h[0][0] else 0.0
+            if exp:
+                missing += max(exp - size, 0)
+                frac_sum += min(size / exp, 1.0)
+                sizes.append(exp)
+            act_out.append({"name": name[:200], "folder": folder[:200], "size": size,
+                            "expected": exp or 0, "speed": round(fs),
+                            "eta": round(max(exp - size, 0) / fs) if exp and fs > 0 else -1})
+        avg = sum(sizes) / len(sizes) if sizes else 0
+        eta, fraction = -1, -1.0
+        if total:
+            fraction = min((done_n + frac_sum) / total, 1.0)
+            queued = max(total - done_n - len(active), 0)
+            if done_n >= total:
+                eta = 0
+            elif speed > 0 and avg:
+                eta = round((missing + queued * avg) / speed)
+        elif act_out and act_out[0]["expected"]:
+            fraction = -1.0                                # unknown overall; widget shows the file
+
+        out = {
+            "time": round(now),
+            "live": bool(live),
+            "peers": peers[:4],
+            "speed": round(speed),
+            "speeds": list(speeds),
+            "total": total or 0,
+            "done": done_n,
+            "doneBytes": done_bytes,
+            "fraction": round(fraction, 4),
+            "eta": eta,
+            "sessionStart": round(session[-1][0]) if session else 0,
+            "sessionEnd": round(session[0][0]) if session else 0,
+            "active": act_out[:6],
+            "stalled": [{"name": display_name(p)[0][:200], "size": files[p][0],
+                         "expected": expected_size(p, os.path.splitext(display_name(p)[0])[1].lower()) or 0,
+                         "idle": round(now - files[p][1])} for p in sorted(stalled)[:4]],
+            "recent": [{"name": display_name(p)[0][:200], "folder": display_name(p)[1][:200], "size": s}
+                       for _c, p, s in session[:8]],
+        }
+        sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        time.sleep(REFRESH if (live or active) else 3.0)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--total", type=int, default=None, help="number of files being sent")
+    ap.add_argument("--since", default=None, help="count files finished since HH:MM today")
+    ap.add_argument("--json", action="store_true", help="print one JSON status line per second (bar widget feed)")
+    ap.add_argument("--set-total", type=int, default=None, metavar="N",
+                    help="record how many files the current transfer has (0 clears) and exit")
+    args = ap.parse_args()
+    if args.set_total is not None:
+        if args.set_total < 0 or args.set_total > 1_000_000:
+            sys.exit("total must be between 0 and 1000000")
+        set_total(args.set_total)
+        return
+    if args.json:
+        try:
+            json_loop()
+        except (KeyboardInterrupt, BrokenPipeError):
+            pass
+        return
+
+    started = time.time()
+    since = started
+    if args.since:
+        hh, mm = (int(x) for x in args.since.split(":"))
+        since = datetime.datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0).timestamp()
+
+    keys = Keys()
+    total = args.total
+    history = {}                     # path -> deque of (time, size), per-file speed
+    volume = deque()                 # (time, total bytes under ROOT), overall speed
+    finished = {}                    # path -> (ctime, size)
+
+    sys.stdout.write(CSI + "2J" + CSI + "H")
+    if total is None and keys.fd is not None:
+        keys.raw()
+        total = ask_total(keys, None, 1)
+    keys.raw()
+    sys.stdout.write(CSI + "?25l" + CSI + "2J")
+    try:
+        while True:
+            now = time.time()
+            files = scan()
+            held = files_open_by_uploader()
+            peers = phone_connections()
+
+            # overall speed: change in total bytes under ROOT over the last SPEED_WINDOW s
+            volume.append((now, sum(v[0] for v in files.values())))
+            while volume and now - volume[0][0] > SPEED_WINDOW:
+                volume.popleft()
+            speed = 0.0
+            if len(volume) >= 2 and volume[-1][0] > volume[0][0]:
+                speed = max(0.0, (volume[-1][1] - volume[0][1]) / (volume[-1][0] - volume[0][0]))
+
+            # classify every file
+            active, stalled = [], []
+            for p, (size, mtime, ctime) in files.items():
+                hist = history.setdefault(p, deque(maxlen=30))
+                if not hist or hist[-1][1] != size:
+                    hist.append((now, size))
+                hidden = os.path.basename(p).startswith(".")
+                if p in held or (hidden and now - mtime < ACTIVE_SECS):
+                    active.append(p)
+                    finished.pop(p, None)
+                elif hidden:
+                    if now - mtime >= STALL_SECS:
+                        stalled.append(p)
+                elif ctime >= since:
+                    finished[p] = (ctime, size)
+            for p in list(history):
+                if p not in files:
+                    del history[p]
+            for p in list(finished):
+                if p not in files:          # moved by the sorter or deleted: the new path is counted instead
+                    del finished[p]
+
+            # ── overall numbers ──
+            done_n = len(finished)
+            done_bytes = sum(v[1] for v in finished.values())
+            in_flight_missing, in_flight_frac, sizes = 0, 0.0, [v[1] for v in finished.values()]
+            for p in active:
+                size = files[p][0]
+                exp = expected_size(p, os.path.splitext(display_name(p)[0])[1].lower())
+                if exp:
+                    in_flight_missing += max(exp - size, 0)
+                    in_flight_frac += min(size / exp, 1.0)
+                    sizes.append(exp)
+            avg = sum(sizes) / len(sizes) if sizes else None
+
+            # ── draw ──
+            cols, rows = shutil.get_terminal_size((100, 30))
+            cols = max(cols, 50)
+            name_w = min(44, max(16, cols // 3))
+            lines = []
+            lines.append(BOLD + CYAN + " iPhone → PC transfers " + RESET + DIM + f" {ROOT}" + RESET)
+            if peers:
+                lines.append(GREEN + "● Phone connected" + RESET + DIM + "  (" + ", ".join(peers) + ")" + RESET)
+            else:
+                lines.append(DIM + "○ No phone connected — start a transfer in PhotoSync" + RESET)
+            lines.append("")
+
+            # overall block
+            ow = max(10, cols - 26)
+            if total:
+                frac = min((done_n + in_flight_frac) / total, 1.0)
+                queued = max(total - done_n - len(active), 0)
+                eta = None
+                if speed > 0 and avg:
+                    eta = (in_flight_missing + queued * avg) / speed
+                if done_n >= total:
+                    eta = 0
+                lines.append(BOLD + "Overall" + RESET)
+                lines.append(f"  {bar(frac, ow, GREEN)} {100 * frac:5.1f}%")
+                lines.append(BOLD + f"  {done_n} of {total} files done" + RESET
+                             + f"  ·  {human(done_bytes)}  ·  {human(speed)}/s  ·  "
+                             + BOLD + f"time left ≈ {duration(eta)}" + RESET)
+                if done_n >= total:
+                    lines.append(GREEN + BOLD + "  ✓ All files received" + RESET)
+            else:
+                lines.append(BOLD + "Overall" + RESET)
+                lines.append(f"  {done_n} files done  ·  {human(done_bytes)}  ·  {human(speed)}/s")
+                lines.append(YELLOW + "  press t and type how many files you are sending to see % done and time left" + RESET)
+            lines.append("")
+
+            # per-file block
+            bar_w = max(10, cols - name_w - 12)
+            lines.append(BOLD + f"Uploading now ({len(active)})" + RESET)
+            if not active:
+                lines.append(DIM + "  nothing is arriving at the moment" + RESET)
+            for p in sorted(active, key=lambda q: files[q][1], reverse=True)[:6]:
+                size = files[p][0]
+                name, folder = display_name(p)
+                exp = expected_size(p, os.path.splitext(name)[1].lower())
+                hist = [s for s in history.get(p, []) if now - s[0] <= 5] or list(history.get(p, []))[-1:]
+                fspeed = 0.0
+                if len(hist) >= 2 and hist[-1][0] > hist[0][0]:
+                    fspeed = (hist[-1][1] - hist[0][1]) / (hist[-1][0] - hist[0][0])
+                frac = min(size / exp, 1.0) if exp else None
+                feta = max(exp - size, 0) / fspeed if exp and fspeed > 0 else None
+                pct = f"{100 * frac:5.1f}%" if frac is not None else "   ?  "
+                amount = f"{human(size)} / {human(exp)}" if exp else f"{human(size)} received"
+                lines.append(f"  {name[:name_w]:<{name_w}} {bar(frac, bar_w, BLUE)} {pct}")
+                lines.append(DIM + f"  {'':<{name_w}} {amount:<24} {human(fspeed) + '/s':>10}"
+                             f"   left {duration(feta)}" + (f"   in {folder}" if folder else "") + RESET)
+
+            if stalled:
+                lines.append("")
+                lines.append(YELLOW + BOLD + f"Stalled — partial files not growing ({len(stalled)})" + RESET)
+                for p in sorted(stalled)[:4]:
+                    size, mtime, _c = files[p]
+                    name, _folder = display_name(p)
+                    exp = expected_size(p, os.path.splitext(name)[1].lower())
+                    pct = f"{100 * size / exp:.0f}% of {human(exp)}" if exp else human(size)
+                    lines.append(YELLOW + f"  {name[:name_w]:<{name_w}} stopped at {pct}, "
+                                 f"idle {duration(now - mtime)}" + RESET)
+
+            lines.append("")
+            lines.append(BOLD + "Recently finished" + RESET)
+            room = max(1, rows - len(lines) - 3)
+            recent = sorted(finished.items(), key=lambda kv: kv[1][0], reverse=True)[:room]
+            for p, (_ct, size) in recent:
+                name, folder = display_name(p)
+                lines.append(GREEN + "  ✓ " + RESET + f"{name[:name_w]:<{name_w}} {human(size):>10}"
+                             + DIM + f"  {folder}" + RESET)
+            if not recent:
+                lines.append(DIM + "  none yet" + RESET)
+
+            lines.append("")
+            lines.append(DIM + f"t = set total files · Ctrl+C = close · counting since "
+                         f"{datetime.datetime.fromtimestamp(since):%H:%M}" + RESET)
+
+            out = CSI + "H" + "".join(l + CSI + "K\n" for l in lines[:rows - 1]) + CSI + "J"
+            sys.stdout.write(out)
+            sys.stdout.flush()
+
+            key = keys.wait(REFRESH)
+            if key in ("t", "T"):
+                total = ask_total(keys, total, rows)
+                sys.stdout.write(CSI + "2J")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        keys.cooked()
+        sys.stdout.write(CSI + "?25h" + RESET + "\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+# never commit the real WebDAV login
+config/iphone-webdav.env
+*.env
+*.bak*
+__pycache__/
